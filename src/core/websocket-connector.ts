@@ -9,16 +9,121 @@
  */
 
 import type { IFigmaConnector } from './figma-connector.js';
-import type { FigmaWebSocketServer } from './websocket-server.js';
+import { BridgeCommandError, type FigmaWebSocketServer } from './websocket-server.js';
 import { createChildLogger } from './logger.js';
 
 const logger = createChildLogger({ component: 'websocket-connector' });
 
+export interface WebSocketConnectorRecoveryOptions {
+  enabled?: boolean;
+  reconnectTimeoutMs?: number;
+  probeTimeoutMs?: number;
+  relaunchHook?: () => Promise<void>;
+}
+
 export class WebSocketConnector implements IFigmaConnector {
   private wsServer: FigmaWebSocketServer;
+  private recoveryOptions: Required<Omit<WebSocketConnectorRecoveryOptions, 'relaunchHook'>> & Pick<WebSocketConnectorRecoveryOptions, 'relaunchHook'>;
+  private recoveryInFlight: Promise<void> | null = null;
 
-  constructor(wsServer: FigmaWebSocketServer) {
+  constructor(wsServer: FigmaWebSocketServer, recoveryOptions?: WebSocketConnectorRecoveryOptions) {
     this.wsServer = wsServer;
+    this.recoveryOptions = {
+      enabled: recoveryOptions?.enabled ?? true,
+      reconnectTimeoutMs: recoveryOptions?.reconnectTimeoutMs ?? 15000,
+      probeTimeoutMs: recoveryOptions?.probeTimeoutMs ?? 3000,
+      relaunchHook: recoveryOptions?.relaunchHook,
+    };
+  }
+
+  private static readonly SAFE_RETRY_METHODS = new Set([
+    'GET_VARIABLES_DATA',
+    'GET_COMPONENT',
+    'GET_LOCAL_COMPONENTS',
+    'GET_ANNOTATIONS',
+    'GET_ANNOTATION_CATEGORIES',
+    'DEEP_GET_COMPONENT',
+    'ANALYZE_COMPONENT_SET',
+    'CAPTURE_SCREENSHOT',
+    'LINT_DESIGN',
+    'AUDIT_COMPONENT_ACCESSIBILITY',
+    'GET_BOARD_CONTENTS',
+    'GET_CONNECTIONS',
+    'LIST_SLIDES',
+    'GET_SLIDE_CONTENT',
+    'GET_SLIDE_GRID',
+    'GET_SLIDE_TRANSITION',
+    'GET_FOCUSED_SLIDE',
+    'GET_TEXT_STYLES',
+    'GET_FILE_INFO',
+  ]);
+
+  private async ensureBridgeReady(): Promise<void> {
+    if (this.wsServer.isClientConnected()) return;
+    await this.recoverBridge('bridge_unavailable_preflight');
+  }
+
+  private async recoverBridge(trigger: string): Promise<void> {
+    if (!this.recoveryOptions.enabled) return;
+    if (this.recoveryInFlight) return this.recoveryInFlight;
+
+    this.recoveryInFlight = (async () => {
+      logger.warn({ trigger }, 'Bridge recovery started');
+      if (this.recoveryOptions.relaunchHook) {
+        logger.info('Invoking bridge relaunch hook');
+        await this.recoveryOptions.relaunchHook();
+      }
+
+      await this.wsServer.waitForClientConnection(this.recoveryOptions.reconnectTimeoutMs);
+      const probe = await this.wsServer.sendCommand('GET_FILE_INFO', {}, this.recoveryOptions.probeTimeoutMs);
+      if (!probe?.success) {
+        throw new Error(`Bridge probe failed after reconnect: ${probe?.error || 'unknown error'}`);
+      }
+      logger.info({ fileName: probe.fileInfo?.fileName, fileKey: probe.fileInfo?.fileKey }, 'Bridge recovery succeeded');
+    })();
+
+    try {
+      await this.recoveryInFlight;
+    } finally {
+      this.recoveryInFlight = null;
+    }
+  }
+
+  private isDisconnectedError(error: unknown): boolean {
+    if (error instanceof BridgeCommandError) {
+      return ['NO_ACTIVE_FILE', 'NO_CLIENT_CONNECTED', 'CLIENT_DISCONNECTED', 'SEND_FAILED'].includes(error.code);
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return message.includes('No active file connected')
+      || message.includes('No WebSocket client connected')
+      || message.includes('disconnected')
+      || message.includes('Connection replaced');
+  }
+
+  private async sendBridgeCommand(
+    method: string,
+    params: Record<string, any> = {},
+    timeoutMs = 15000,
+    targetFileKey?: string,
+  ): Promise<any> {
+    await this.ensureBridgeReady();
+
+    try {
+      return await this.wsServer.sendCommand(method, params, timeoutMs, targetFileKey);
+    } catch (error) {
+      if (!this.isDisconnectedError(error)) throw error;
+
+      logger.warn({ method, error: error instanceof Error ? error.message : String(error) }, 'Bridge command failed due to disconnected bridge, attempting recovery');
+      await this.recoverBridge('command_failed_disconnected');
+
+      if (!WebSocketConnector.SAFE_RETRY_METHODS.has(method)) {
+        logger.warn({ method }, 'Bridge recovered but skipping automatic retry for mutating/unknown command');
+        throw error;
+      }
+
+      logger.info({ method }, 'Retrying bridge command once after successful recovery');
+      return this.wsServer.sendCommand(method, params, timeoutMs, targetFileKey);
+    }
   }
 
   async initialize(): Promise<void> {
@@ -39,12 +144,12 @@ export class WebSocketConnector implements IFigmaConnector {
   // ============================================================================
 
   async executeInPluginContext<T = any>(code: string): Promise<T> {
-    return this.wsServer.sendCommand('EXECUTE_CODE', { code, timeout: 5000 }, 7000);
+    return this.sendBridgeCommand('EXECUTE_CODE', { code, timeout: 5000 }, 7000);
   }
 
   async getVariablesFromPluginUI(fileKey?: string): Promise<any> {
     // Request the cached variables data that the plugin UI holds in window.__figmaVariablesData
-    return this.wsServer.sendCommand('GET_VARIABLES_DATA', {}, 10000, fileKey);
+    return this.sendBridgeCommand('GET_VARIABLES_DATA', {}, 10000, fileKey);
   }
 
   async getVariables(fileKey?: string): Promise<any> {
@@ -69,11 +174,11 @@ export class WebSocketConnector implements IFigmaConnector {
         }
       })()
     `;
-    return this.wsServer.sendCommand('EXECUTE_CODE', { code, timeout: 30000 }, 32000, fileKey);
+    return this.sendBridgeCommand('EXECUTE_CODE', { code, timeout: 30000 }, 32000, fileKey);
   }
 
   async executeCodeViaUI(code: string, timeoutMs = 5000): Promise<any> {
-    return this.wsServer.sendCommand('EXECUTE_CODE', { code, timeout: timeoutMs }, timeoutMs + 2000);
+    return this.sendBridgeCommand('EXECUTE_CODE', { code, timeout: timeoutMs }, timeoutMs + 2000);
   }
 
   // ============================================================================
@@ -81,7 +186,7 @@ export class WebSocketConnector implements IFigmaConnector {
   // ============================================================================
 
   async updateVariable(variableId: string, modeId: string, value: any): Promise<any> {
-    return this.wsServer.sendCommand('UPDATE_VARIABLE', { variableId, modeId, value });
+    return this.sendBridgeCommand('UPDATE_VARIABLE', { variableId, modeId, value });
   }
 
   async createVariable(
@@ -96,26 +201,26 @@ export class WebSocketConnector implements IFigmaConnector {
       if (options.description) params.description = options.description;
       if (options.scopes) params.scopes = options.scopes;
     }
-    return this.wsServer.sendCommand('CREATE_VARIABLE', params);
+    return this.sendBridgeCommand('CREATE_VARIABLE', params);
   }
 
   async deleteVariable(variableId: string): Promise<any> {
-    return this.wsServer.sendCommand('DELETE_VARIABLE', { variableId });
+    return this.sendBridgeCommand('DELETE_VARIABLE', { variableId });
   }
 
   async refreshVariables(): Promise<any> {
-    return this.wsServer.sendCommand('REFRESH_VARIABLES', {}, 300000);
+    return this.sendBridgeCommand('REFRESH_VARIABLES', {}, 300000);
   }
 
   async renameVariable(variableId: string, newName: string): Promise<any> {
-    const result = await this.wsServer.sendCommand('RENAME_VARIABLE', { variableId, newName });
+    const result = await this.sendBridgeCommand('RENAME_VARIABLE', { variableId, newName });
     // oldName may be embedded in variable data if ui.html handleResult doesn't pass it through
     if (!result.oldName && result.variable?.oldName) result.oldName = result.variable.oldName;
     return result;
   }
 
   async setVariableDescription(variableId: string, description: string): Promise<any> {
-    return this.wsServer.sendCommand('SET_VARIABLE_DESCRIPTION', { variableId, description });
+    return this.sendBridgeCommand('SET_VARIABLE_DESCRIPTION', { variableId, description });
   }
 
   // ============================================================================
@@ -123,11 +228,11 @@ export class WebSocketConnector implements IFigmaConnector {
   // ============================================================================
 
   async addMode(collectionId: string, modeName: string): Promise<any> {
-    return this.wsServer.sendCommand('ADD_MODE', { collectionId, modeName });
+    return this.sendBridgeCommand('ADD_MODE', { collectionId, modeName });
   }
 
   async renameMode(collectionId: string, modeId: string, newName: string): Promise<any> {
-    const result = await this.wsServer.sendCommand('RENAME_MODE', { collectionId, modeId, newName });
+    const result = await this.sendBridgeCommand('RENAME_MODE', { collectionId, modeId, newName });
     // oldName may be embedded in collection data if ui.html handleResult doesn't pass it through
     if (!result.oldName && result.collection?.oldName) result.oldName = result.collection.oldName;
     return result;
@@ -143,11 +248,11 @@ export class WebSocketConnector implements IFigmaConnector {
       if (options.initialModeName) params.initialModeName = options.initialModeName;
       if (options.additionalModes) params.additionalModes = options.additionalModes;
     }
-    return this.wsServer.sendCommand('CREATE_VARIABLE_COLLECTION', params);
+    return this.sendBridgeCommand('CREATE_VARIABLE_COLLECTION', params);
   }
 
   async deleteVariableCollection(collectionId: string): Promise<any> {
-    return this.wsServer.sendCommand('DELETE_VARIABLE_COLLECTION', { collectionId });
+    return this.sendBridgeCommand('DELETE_VARIABLE_COLLECTION', { collectionId });
   }
 
   // ============================================================================
@@ -155,15 +260,15 @@ export class WebSocketConnector implements IFigmaConnector {
   // ============================================================================
 
   async getComponentFromPluginUI(nodeId: string): Promise<any> {
-    return this.wsServer.sendCommand('GET_COMPONENT', { nodeId }, 10000);
+    return this.sendBridgeCommand('GET_COMPONENT', { nodeId }, 10000);
   }
 
   async getLocalComponents(): Promise<any> {
-    return this.wsServer.sendCommand('GET_LOCAL_COMPONENTS', {}, 300000);
+    return this.sendBridgeCommand('GET_LOCAL_COMPONENTS', {}, 300000);
   }
 
   async setNodeDescription(nodeId: string, description: string, descriptionMarkdown?: string): Promise<any> {
-    return this.wsServer.sendCommand('SET_NODE_DESCRIPTION', { nodeId, description, descriptionMarkdown });
+    return this.sendBridgeCommand('SET_NODE_DESCRIPTION', { nodeId, description, descriptionMarkdown });
   }
 
   // ============================================================================
@@ -171,23 +276,23 @@ export class WebSocketConnector implements IFigmaConnector {
   // ============================================================================
 
   async getAnnotations(nodeId: string, includeChildren?: boolean, depth?: number): Promise<any> {
-    return this.wsServer.sendCommand('GET_ANNOTATIONS', { nodeId, includeChildren, depth }, 10000);
+    return this.sendBridgeCommand('GET_ANNOTATIONS', { nodeId, includeChildren, depth }, 10000);
   }
 
   async setAnnotations(nodeId: string, annotations: any[], mode?: 'replace' | 'append'): Promise<any> {
-    return this.wsServer.sendCommand('SET_ANNOTATIONS', { nodeId, annotations, mode: mode || 'replace' });
+    return this.sendBridgeCommand('SET_ANNOTATIONS', { nodeId, annotations, mode: mode || 'replace' });
   }
 
   async getAnnotationCategories(): Promise<any> {
-    return this.wsServer.sendCommand('GET_ANNOTATION_CATEGORIES', {}, 5000);
+    return this.sendBridgeCommand('GET_ANNOTATION_CATEGORIES', {}, 5000);
   }
 
   async deepGetComponent(nodeId: string, depth?: number): Promise<any> {
-    return this.wsServer.sendCommand('DEEP_GET_COMPONENT', { nodeId, depth: depth || 10 }, 30000);
+    return this.sendBridgeCommand('DEEP_GET_COMPONENT', { nodeId, depth: depth || 10 }, 30000);
   }
 
   async analyzeComponentSet(nodeId: string): Promise<any> {
-    return this.wsServer.sendCommand('ANALYZE_COMPONENT_SET', { nodeId }, 30000);
+    return this.sendBridgeCommand('ANALYZE_COMPONENT_SET', { nodeId }, 30000);
   }
 
   async addComponentProperty(
@@ -199,15 +304,15 @@ export class WebSocketConnector implements IFigmaConnector {
   ): Promise<any> {
     const params: any = { nodeId, propertyName, propertyType: type, defaultValue };
     if (options?.preferredValues) params.preferredValues = options.preferredValues;
-    return this.wsServer.sendCommand('ADD_COMPONENT_PROPERTY', params);
+    return this.sendBridgeCommand('ADD_COMPONENT_PROPERTY', params);
   }
 
   async editComponentProperty(nodeId: string, propertyName: string, newValue: any): Promise<any> {
-    return this.wsServer.sendCommand('EDIT_COMPONENT_PROPERTY', { nodeId, propertyName, newValue });
+    return this.sendBridgeCommand('EDIT_COMPONENT_PROPERTY', { nodeId, propertyName, newValue });
   }
 
   async deleteComponentProperty(nodeId: string, propertyName: string): Promise<any> {
-    return this.wsServer.sendCommand('DELETE_COMPONENT_PROPERTY', { nodeId, propertyName });
+    return this.sendBridgeCommand('DELETE_COMPONENT_PROPERTY', { nodeId, propertyName });
   }
 
   async instantiateComponent(componentKey: string, options?: any): Promise<any> {
@@ -220,7 +325,7 @@ export class WebSocketConnector implements IFigmaConnector {
       if (options.variant) params.variant = options.variant;
       if (options.parentId) params.parentId = options.parentId;
     }
-    return this.wsServer.sendCommand('INSTANTIATE_COMPONENT', params);
+    return this.sendBridgeCommand('INSTANTIATE_COMPONENT', params);
   }
 
   // ============================================================================
@@ -228,41 +333,41 @@ export class WebSocketConnector implements IFigmaConnector {
   // ============================================================================
 
   async resizeNode(nodeId: string, width: number, height: number, withConstraints = true): Promise<any> {
-    return this.wsServer.sendCommand('RESIZE_NODE', { nodeId, width, height, withConstraints });
+    return this.sendBridgeCommand('RESIZE_NODE', { nodeId, width, height, withConstraints });
   }
 
   async moveNode(nodeId: string, x: number, y: number): Promise<any> {
-    return this.wsServer.sendCommand('MOVE_NODE', { nodeId, x, y });
+    return this.sendBridgeCommand('MOVE_NODE', { nodeId, x, y });
   }
 
   async setNodeFills(nodeId: string, fills: any[]): Promise<any> {
-    return this.wsServer.sendCommand('SET_NODE_FILLS', { nodeId, fills });
+    return this.sendBridgeCommand('SET_NODE_FILLS', { nodeId, fills });
   }
 
   async setNodeStrokes(nodeId: string, strokes: any[], strokeWeight?: number): Promise<any> {
     const params: any = { nodeId, strokes };
     if (strokeWeight !== undefined) params.strokeWeight = strokeWeight;
-    return this.wsServer.sendCommand('SET_NODE_STROKES', params);
+    return this.sendBridgeCommand('SET_NODE_STROKES', params);
   }
 
   async setNodeOpacity(nodeId: string, opacity: number): Promise<any> {
-    return this.wsServer.sendCommand('SET_NODE_OPACITY', { nodeId, opacity });
+    return this.sendBridgeCommand('SET_NODE_OPACITY', { nodeId, opacity });
   }
 
   async setNodeCornerRadius(nodeId: string, radius: number): Promise<any> {
-    return this.wsServer.sendCommand('SET_NODE_CORNER_RADIUS', { nodeId, radius });
+    return this.sendBridgeCommand('SET_NODE_CORNER_RADIUS', { nodeId, radius });
   }
 
   async cloneNode(nodeId: string): Promise<any> {
-    return this.wsServer.sendCommand('CLONE_NODE', { nodeId });
+    return this.sendBridgeCommand('CLONE_NODE', { nodeId });
   }
 
   async deleteNode(nodeId: string): Promise<any> {
-    return this.wsServer.sendCommand('DELETE_NODE', { nodeId });
+    return this.sendBridgeCommand('DELETE_NODE', { nodeId });
   }
 
   async renameNode(nodeId: string, newName: string): Promise<any> {
-    return this.wsServer.sendCommand('RENAME_NODE', { nodeId, newName });
+    return this.sendBridgeCommand('RENAME_NODE', { nodeId, newName });
   }
 
   async setTextContent(nodeId: string, characters: string, options?: any): Promise<any> {
@@ -272,11 +377,11 @@ export class WebSocketConnector implements IFigmaConnector {
       if (options.fontWeight) params.fontWeight = options.fontWeight;
       if (options.fontFamily) params.fontFamily = options.fontFamily;
     }
-    return this.wsServer.sendCommand('SET_TEXT_CONTENT', params);
+    return this.sendBridgeCommand('SET_TEXT_CONTENT', params);
   }
 
   async createChildNode(parentId: string, nodeType: string, properties?: any): Promise<any> {
-    return this.wsServer.sendCommand('CREATE_CHILD_NODE', { parentId, nodeType, properties: properties || {} });
+    return this.sendBridgeCommand('CREATE_CHILD_NODE', { parentId, nodeType, properties: properties || {} });
   }
 
   // ============================================================================
@@ -287,11 +392,11 @@ export class WebSocketConnector implements IFigmaConnector {
     const params: any = { nodeId };
     if (options?.format) params.format = options.format;
     if (options?.scale) params.scale = options.scale;
-    return this.wsServer.sendCommand('CAPTURE_SCREENSHOT', params, 30000);
+    return this.sendBridgeCommand('CAPTURE_SCREENSHOT', params, 30000);
   }
 
   async setInstanceProperties(nodeId: string, properties: any): Promise<any> {
-    return this.wsServer.sendCommand('SET_INSTANCE_PROPERTIES', { nodeId, properties });
+    return this.sendBridgeCommand('SET_INSTANCE_PROPERTIES', { nodeId, properties });
   }
 
   // ============================================================================
@@ -299,7 +404,7 @@ export class WebSocketConnector implements IFigmaConnector {
   // ============================================================================
 
   async setImageFill(nodeIds: string[], imageData: string, scaleMode = 'FILL'): Promise<any> {
-    return this.wsServer.sendCommand('SET_IMAGE_FILL', { nodeIds, imageData, scaleMode }, 60000);
+    return this.sendBridgeCommand('SET_IMAGE_FILL', { nodeIds, imageData, scaleMode }, 60000);
   }
 
   // ============================================================================
@@ -312,7 +417,7 @@ export class WebSocketConnector implements IFigmaConnector {
     if (rules) params.rules = rules;
     if (maxDepth !== undefined) params.maxDepth = maxDepth;
     if (maxFindings !== undefined) params.maxFindings = maxFindings;
-    return this.wsServer.sendCommand('LINT_DESIGN', params, 120000);
+    return this.sendBridgeCommand('LINT_DESIGN', params, 120000);
   }
 
   // ============================================================================
@@ -323,7 +428,7 @@ export class WebSocketConnector implements IFigmaConnector {
     const params: any = {};
     if (nodeId) params.nodeId = nodeId;
     if (targetSize !== undefined) params.targetSize = targetSize;
-    return this.wsServer.sendCommand('AUDIT_COMPONENT_ACCESSIBILITY', params, 120000);
+    return this.sendBridgeCommand('AUDIT_COMPONENT_ACCESSIBILITY', params, 120000);
   }
 
   // ============================================================================
@@ -331,39 +436,39 @@ export class WebSocketConnector implements IFigmaConnector {
   // ============================================================================
 
   async createSticky(params: { text: string; color?: string; x?: number; y?: number }): Promise<any> {
-    return this.wsServer.sendCommand('CREATE_STICKY', params);
+    return this.sendBridgeCommand('CREATE_STICKY', params);
   }
 
   async createStickies(params: { stickies: Array<{ text: string; color?: string; x?: number; y?: number }> }): Promise<any> {
-    return this.wsServer.sendCommand('CREATE_STICKIES', params, 30000);
+    return this.sendBridgeCommand('CREATE_STICKIES', params, 30000);
   }
 
   async createConnector(params: { startNodeId: string; endNodeId: string; label?: string; startMagnet?: string; endMagnet?: string }): Promise<any> {
-    return this.wsServer.sendCommand('CREATE_CONNECTOR', params);
+    return this.sendBridgeCommand('CREATE_CONNECTOR', params);
   }
 
   async createShapeWithText(params: { text?: string; shapeType?: string; x?: number; y?: number; width?: number; height?: number; fillColor?: string; strokeColor?: string; fontSize?: number; strokeDashPattern?: string }): Promise<any> {
-    return this.wsServer.sendCommand('CREATE_SHAPE_WITH_TEXT', params);
+    return this.sendBridgeCommand('CREATE_SHAPE_WITH_TEXT', params);
   }
 
   async createSection(params: { name?: string; x?: number; y?: number; width?: number; height?: number; fillColor?: string }): Promise<any> {
-    return this.wsServer.sendCommand('CREATE_SECTION', params);
+    return this.sendBridgeCommand('CREATE_SECTION', params);
   }
 
   async createTable(params: { rows: number; columns: number; data?: string[][]; x?: number; y?: number }): Promise<any> {
-    return this.wsServer.sendCommand('CREATE_TABLE', params, 30000);
+    return this.sendBridgeCommand('CREATE_TABLE', params, 30000);
   }
 
   async createCodeBlock(params: { code: string; language?: string; x?: number; y?: number }): Promise<any> {
-    return this.wsServer.sendCommand('CREATE_CODE_BLOCK', params);
+    return this.sendBridgeCommand('CREATE_CODE_BLOCK', params);
   }
 
   async getBoardContents(params: { nodeTypes?: string[]; maxNodes?: number }): Promise<any> {
-    return this.wsServer.sendCommand('GET_BOARD_CONTENTS', params, 30000);
+    return this.sendBridgeCommand('GET_BOARD_CONTENTS', params, 30000);
   }
 
   async getConnections(): Promise<any> {
-    return this.wsServer.sendCommand('GET_CONNECTIONS', {}, 15000);
+    return this.sendBridgeCommand('GET_CONNECTIONS', {}, 15000);
   }
 
   // ============================================================================
@@ -371,71 +476,71 @@ export class WebSocketConnector implements IFigmaConnector {
   // ============================================================================
 
   async listSlides(): Promise<any> {
-    return this.wsServer.sendCommand('LIST_SLIDES', {}, 10000);
+    return this.sendBridgeCommand('LIST_SLIDES', {}, 10000);
   }
 
   async getSlideContent(params: { slideId: string }): Promise<any> {
-    return this.wsServer.sendCommand('GET_SLIDE_CONTENT', params, 10000);
+    return this.sendBridgeCommand('GET_SLIDE_CONTENT', params, 10000);
   }
 
   async createSlide(params: { row?: number; col?: number }): Promise<any> {
-    return this.wsServer.sendCommand('CREATE_SLIDE', params, 10000);
+    return this.sendBridgeCommand('CREATE_SLIDE', params, 10000);
   }
 
   async deleteSlide(params: { slideId: string }): Promise<any> {
-    return this.wsServer.sendCommand('DELETE_SLIDE', params, 5000);
+    return this.sendBridgeCommand('DELETE_SLIDE', params, 5000);
   }
 
   async duplicateSlide(params: { slideId: string }): Promise<any> {
-    return this.wsServer.sendCommand('DUPLICATE_SLIDE', params, 5000);
+    return this.sendBridgeCommand('DUPLICATE_SLIDE', params, 5000);
   }
 
   async getSlideGrid(): Promise<any> {
-    return this.wsServer.sendCommand('GET_SLIDE_GRID', {}, 10000);
+    return this.sendBridgeCommand('GET_SLIDE_GRID', {}, 10000);
   }
 
   async reorderSlides(params: { grid: string[][] }): Promise<any> {
-    return this.wsServer.sendCommand('REORDER_SLIDES', params, 15000);
+    return this.sendBridgeCommand('REORDER_SLIDES', params, 15000);
   }
 
   async setSlideTransition(params: { slideId: string; style: string; duration: number; curve: string }): Promise<any> {
-    return this.wsServer.sendCommand('SET_SLIDE_TRANSITION', params, 5000);
+    return this.sendBridgeCommand('SET_SLIDE_TRANSITION', params, 5000);
   }
 
   async getSlideTransition(params: { slideId: string }): Promise<any> {
-    return this.wsServer.sendCommand('GET_SLIDE_TRANSITION', params, 5000);
+    return this.sendBridgeCommand('GET_SLIDE_TRANSITION', params, 5000);
   }
 
   async setSlidesViewMode(params: { mode: string }): Promise<any> {
-    return this.wsServer.sendCommand('SET_SLIDES_VIEW_MODE', params, 5000);
+    return this.sendBridgeCommand('SET_SLIDES_VIEW_MODE', params, 5000);
   }
 
   async getFocusedSlide(): Promise<any> {
-    return this.wsServer.sendCommand('GET_FOCUSED_SLIDE', {}, 5000);
+    return this.sendBridgeCommand('GET_FOCUSED_SLIDE', {}, 5000);
   }
 
   async focusSlide(params: { slideId: string }): Promise<any> {
-    return this.wsServer.sendCommand('FOCUS_SLIDE', params, 5000);
+    return this.sendBridgeCommand('FOCUS_SLIDE', params, 5000);
   }
 
   async skipSlide(params: { slideId: string; skip: boolean }): Promise<any> {
-    return this.wsServer.sendCommand('SKIP_SLIDE', params, 5000);
+    return this.sendBridgeCommand('SKIP_SLIDE', params, 5000);
   }
 
   async addTextToSlide(params: { slideId: string; text: string; x?: number; y?: number; fontSize?: number; fontFamily?: string; fontStyle?: string; color?: string; textAlign?: string; width?: number; lineHeight?: number; letterSpacing?: number; textCase?: string }): Promise<any> {
-    return this.wsServer.sendCommand('ADD_TEXT_TO_SLIDE', params, 10000);
+    return this.sendBridgeCommand('ADD_TEXT_TO_SLIDE', params, 10000);
   }
 
   async addShapeToSlide(params: { slideId: string; shapeType: string; x: number; y: number; width: number; height: number; fillColor?: string }): Promise<any> {
-    return this.wsServer.sendCommand('ADD_SHAPE_TO_SLIDE', params, 5000);
+    return this.sendBridgeCommand('ADD_SHAPE_TO_SLIDE', params, 5000);
   }
 
   async setSlideBackground(params: { slideId: string; color: string }): Promise<any> {
-    return this.wsServer.sendCommand('SET_SLIDE_BACKGROUND', params, 5000);
+    return this.sendBridgeCommand('SET_SLIDE_BACKGROUND', params, 5000);
   }
 
   async getTextStyles(): Promise<any> {
-    return this.wsServer.sendCommand('GET_TEXT_STYLES', {}, 5000);
+    return this.sendBridgeCommand('GET_TEXT_STYLES', {}, 5000);
   }
 
   // ============================================================================

@@ -478,6 +478,120 @@ describe('WebSocketConnector', () => {
       expect(() => connector.clearFrameCache()).not.toThrow();
     });
   });
+
+  describe('bridge recovery', () => {
+    test('recovers when client is missing before command and retries read command once', async () => {
+      server = new FigmaWebSocketServer({ port: TEST_PORT });
+      await server.start();
+
+      let relaunched = 0;
+      connector = new WebSocketConnector(server, {
+        reconnectTimeoutMs: 2000,
+        probeTimeoutMs: 2000,
+        relaunchHook: async () => {
+          relaunched += 1;
+          const reconnectClient = await connectClient(server, TEST_PORT);
+          reconnectClient.on('message', (data: Buffer) => {
+            const msg = JSON.parse(data.toString());
+            if (msg.id && msg.method === 'GET_FILE_INFO') {
+              reconnectClient.send(JSON.stringify({
+                id: msg.id,
+                result: { success: true, fileInfo: { fileName: 'Recovered', fileKey: 'test-file-key' } },
+              }));
+            } else if (msg.id && msg.method === 'GET_COMPONENT') {
+              reconnectClient.send(JSON.stringify({
+                id: msg.id,
+                result: { success: true, component: { id: '123', name: 'Recovered component' } },
+              }));
+            }
+          });
+        },
+      });
+
+      const result = await connector.getComponentFromPluginUI('123');
+      expect(result.success).toBe(true);
+      expect(result.component.name).toBe('Recovered component');
+      expect(relaunched).toBe(1);
+    });
+
+    test('recovers after disconnect during command and retries read command', async () => {
+      await setup();
+
+      let firstCommand = true;
+      client!.removeAllListeners('message');
+      client!.on('message', async (data: Buffer) => {
+        const msg = JSON.parse(data.toString());
+        if (!msg.id || !msg.method) return;
+        if (msg.method === 'GET_FILE_INFO') {
+          client!.send(JSON.stringify({
+            id: msg.id,
+            result: { success: true, fileInfo: { fileName: 'Recovered', fileKey: 'test-file-key' } },
+          }));
+          return;
+        }
+        if (msg.method === 'GET_COMPONENT' && firstCommand) {
+          firstCommand = false;
+          await closeClient(client);
+          const recovered = await connectClient(server, TEST_PORT);
+          client = recovered;
+          client.on('message', (nextData: Buffer) => {
+            const next = JSON.parse(nextData.toString());
+            if (next.id && next.method === 'GET_FILE_INFO') {
+              client!.send(JSON.stringify({
+                id: next.id,
+                result: { success: true, fileInfo: { fileName: 'Recovered', fileKey: 'test-file-key' } },
+              }));
+            } else if (next.id && next.method === 'GET_COMPONENT') {
+              client!.send(JSON.stringify({
+                id: next.id,
+                result: { success: true, component: { id: '123', name: 'Recovered on retry' } },
+              }));
+            }
+          });
+        }
+      });
+
+      const result = await connector.getComponentFromPluginUI('123');
+      expect(result.success).toBe(true);
+      expect(result.component.name).toBe('Recovered on retry');
+    });
+
+    test('does not retry mutating command after recovery to avoid duplicate side effects', async () => {
+      await setup();
+
+      client!.removeAllListeners('message');
+      client!.on('message', async (data: Buffer) => {
+        const msg = JSON.parse(data.toString());
+        if (msg.id && msg.method === 'UPDATE_VARIABLE') {
+          await closeClient(client);
+          const recovered = await connectClient(server, TEST_PORT);
+          client = recovered;
+          client.on('message', (nextData: Buffer) => {
+            const next = JSON.parse(nextData.toString());
+            if (next.id && next.method === 'GET_FILE_INFO') {
+              client!.send(JSON.stringify({
+                id: next.id,
+                result: { success: true, fileInfo: { fileName: 'Recovered', fileKey: 'test-file-key' } },
+              }));
+            }
+          });
+        }
+      });
+
+      await expect(connector.updateVariable('var1', 'mode1', 'red')).rejects.toThrow(/disconnected|Connection replaced/i);
+    });
+
+    test('fails when recovery reconnect times out', async () => {
+      server = new FigmaWebSocketServer({ port: TEST_PORT });
+      await server.start();
+      connector = new WebSocketConnector(server, {
+        reconnectTimeoutMs: 100,
+        probeTimeoutMs: 100,
+      });
+
+      await expect(connector.getComponentFromPluginUI('123')).rejects.toThrow('Timed out waiting for Desktop Bridge reconnect');
+    });
+  });
 });
 
 // ============================================================================

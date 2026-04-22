@@ -21,6 +21,8 @@ import { fileURLToPath } from "url";
 import { dirname, resolve, join } from "path";
 import { realpathSync, existsSync, readFileSync, mkdirSync, copyFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
+import { exec as execCommand } from "child_process";
+import { promisify } from "util";
 import { LocalBrowserManager } from "./browser/local.js";
 import { ConsoleMonitor } from "./core/console-monitor.js";
 import { getConfig } from "./core/config.js";
@@ -61,6 +63,7 @@ import { registerFigJamTools } from "./core/figjam-tools.js";
 import { registerSlidesTools } from "./core/slides-tools.js";
 
 const logger = createChildLogger({ component: "local-server" });
+const execAsync = promisify(execCommand);
 
 /**
  * Copy plugin files to a stable directory (~/.figma-console-mcp/plugin/).
@@ -118,6 +121,7 @@ class LocalFigmaConsoleMCP {
 	/** Heartbeat timer that refreshes port file to prove this server is active */
 	private wsHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 	private config = getConfig();
+	private bridgeRelaunchCommand = process.env.FIGMA_BRIDGE_RELAUNCH_CMD?.trim() || "";
 
 	// In-memory cache for variables data to avoid MCP token limits
 	// Maps fileKey -> {data, timestamp}
@@ -245,7 +249,18 @@ If Design Systems Assistant MCP is not available, install it from: https://githu
 		// Try WebSocket first — instant check, no network timeout delay
 		if (this.wsServer?.isClientConnected()) {
 			try {
-				const wsConnector = new WebSocketConnector(this.wsServer);
+				const reconnectTimeoutMs = Number(process.env.FIGMA_BRIDGE_RECOVERY_TIMEOUT_MS || 20000);
+				const probeTimeoutMs = Number(process.env.FIGMA_BRIDGE_RECOVERY_PROBE_TIMEOUT_MS || 4000);
+				const wsConnector = new WebSocketConnector(this.wsServer, {
+					reconnectTimeoutMs: Number.isFinite(reconnectTimeoutMs) ? reconnectTimeoutMs : 20000,
+					probeTimeoutMs: Number.isFinite(probeTimeoutMs) ? probeTimeoutMs : 4000,
+					relaunchHook: this.bridgeRelaunchCommand
+						? async () => {
+								logger.info({ command: this.bridgeRelaunchCommand }, "Running bridge relaunch command");
+								await execAsync(this.bridgeRelaunchCommand);
+							}
+						: undefined,
+				});
 				await wsConnector.initialize();
 				this.desktopConnector = wsConnector;
 				logger.debug("Desktop connector initialized via WebSocket bridge");

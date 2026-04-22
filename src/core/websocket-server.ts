@@ -118,6 +118,24 @@ export interface ClientConnection {
   gracePeriodTimer: ReturnType<typeof setTimeout> | null;
 }
 
+export class BridgeCommandError extends Error {
+  readonly code:
+    | 'NO_ACTIVE_FILE'
+    | 'NO_CLIENT_CONNECTED'
+    | 'COMMAND_TIMEOUT'
+    | 'SEND_FAILED'
+    | 'CLIENT_DISCONNECTED';
+
+  constructor(
+    code: BridgeCommandError['code'],
+    message: string,
+  ) {
+    super(message);
+    this.name = 'BridgeCommandError';
+    this.code = code;
+  }
+}
+
 export class FigmaWebSocketServer extends EventEmitter {
   private wss: WSServer | null = null;
   private httpServer: HttpServer | null = null;
@@ -620,13 +638,19 @@ export class FigmaWebSocketServer extends EventEmitter {
       const fileKey = targetFileKey || this._activeFileKey;
 
       if (!fileKey) {
-        reject(new Error('No active file connected. Make sure the Desktop Bridge plugin is open in Figma.'));
+        reject(new BridgeCommandError(
+          'NO_ACTIVE_FILE',
+          'No active file connected. Make sure the Desktop Bridge plugin is open in Figma.',
+        ));
         return;
       }
 
       const client = this.clients.get(fileKey);
       if (!client || client.ws.readyState !== WebSocket.OPEN) {
-        reject(new Error('No WebSocket client connected. Make sure the Desktop Bridge plugin is open in Figma.'));
+        reject(new BridgeCommandError(
+          'NO_CLIENT_CONNECTED',
+          'No WebSocket client connected. Make sure the Desktop Bridge plugin is open in Figma.',
+        ));
         return;
       }
 
@@ -635,7 +659,10 @@ export class FigmaWebSocketServer extends EventEmitter {
       const timeoutId = setTimeout(() => {
         if (this.pendingRequests.has(id)) {
           this.pendingRequests.delete(id);
-          reject(new Error(`WebSocket command ${method} timed out after ${timeoutMs}ms`));
+          reject(new BridgeCommandError(
+            'COMMAND_TIMEOUT',
+            `WebSocket command ${method} timed out after ${timeoutMs}ms`,
+          ));
         }
       }, timeoutMs);
 
@@ -654,12 +681,45 @@ export class FigmaWebSocketServer extends EventEmitter {
       } catch (sendError) {
         this.pendingRequests.delete(id);
         clearTimeout(timeoutId);
-        reject(new Error(`Failed to send WebSocket command ${method}: ${sendError instanceof Error ? sendError.message : String(sendError)}`));
+        reject(new BridgeCommandError(
+          'SEND_FAILED',
+          `Failed to send WebSocket command ${method}: ${sendError instanceof Error ? sendError.message : String(sendError)}`,
+        ));
         return;
       }
       client.lastActivity = Date.now();
 
       logger.debug({ id, method, fileKey }, 'Sent WebSocket command');
+    });
+  }
+
+  async waitForClientConnection(timeoutMs = 15000): Promise<void> {
+    if (this.isClientConnected()) return;
+
+    await new Promise<void>((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        cleanup();
+        reject(new BridgeCommandError(
+          'NO_CLIENT_CONNECTED',
+          `Timed out waiting for Desktop Bridge reconnect after ${timeoutMs}ms`,
+        ));
+      }, timeoutMs);
+
+      const onConnected = () => {
+        if (this.isClientConnected()) {
+          cleanup();
+          resolve();
+        }
+      };
+
+      const cleanup = () => {
+        clearTimeout(timeoutId);
+        this.off('connected', onConnected);
+        this.off('fileConnected', onConnected);
+      };
+
+      this.on('connected', onConnected);
+      this.on('fileConnected', onConnected);
     });
   }
 
@@ -916,7 +976,7 @@ export class FigmaWebSocketServer extends EventEmitter {
     for (const [id, pending] of this.pendingRequests) {
       if (pending.targetFileKey === fileKey) {
         clearTimeout(pending.timeoutId);
-        pending.reject(new Error(reason));
+        pending.reject(new BridgeCommandError('CLIENT_DISCONNECTED', reason));
         this.pendingRequests.delete(id);
       }
     }
@@ -928,7 +988,7 @@ export class FigmaWebSocketServer extends EventEmitter {
   private rejectPendingRequests(reason: string): void {
     for (const [, pending] of this.pendingRequests) {
       clearTimeout(pending.timeoutId);
-      pending.reject(new Error(reason));
+      pending.reject(new BridgeCommandError('CLIENT_DISCONNECTED', reason));
     }
     this.pendingRequests.clear();
   }
